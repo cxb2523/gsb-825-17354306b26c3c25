@@ -1,0 +1,185 @@
+name: Publish
+
+# Tagging a release is the whole release.
+#
+# This publishes to PyPI and the MCP registry with no stored credentials. Both
+# verify us through GitHub's OIDC: GitHub vouches for this specific workflow at
+# run time, so there is no token to keep, rotate, or leak — and no five-minute
+# registry login to race by hand.
+#
+# What this does NOT replace: the live-Graph smoke test (RELEASING.md step 1).
+# Those need real credentials and cannot run here. Run them BEFORE you tag —
+# a green offline suite is exactly what shipped 1.13.0 and 1.13.1 broken.
+#
+# ClawHub has no OIDC equivalent and stays manual:
+#   clawhub publish "$(pwd)" --version X.Y.Z --tags latest --changelog "..."
+#
+# One-time PyPI setup is required before this can work. See RELEASING.md.
+#
+# Three jobs, so a token exists only where it is used. `build` runs the suite
+# and every dev dependency and gets no token. `pypi` only uploads what `build`
+# built: no checkout, no repo code. `registry` needs the repo for server.json.
+# Only `pypi` runs in the `pypi` environment, which accepts release tags only,
+# and PyPI's trusted publisher names that environment (RELEASING.md appendix).
+# Every action is pinned to a commit SHA; tests/test_workflows_are_pinned.py
+# holds both lines.
+
+on:
+  release:
+    types: [published]
+  # Manual re-run — safe to repeat. PyPI uploads are skipped if already present,
+  # so a dispatch after a partial failure retries only what did not finish.
+  # Dispatch on the release tag (`gh workflow run publish.yml --ref vX.Y.Z`):
+  # the `pypi` environment refuses a run from a branch.
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+
+      # The version lives in three places and they must agree. A mismatch means
+      # a half-updated release — better to stop before anything is published.
+      - name: Version lockstep check
+        id: version
+        run: |
+          PY_VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ -z "$PY_VERSION" ]; then
+            echo "::error::could not read version from pyproject.toml"
+            exit 1
+          fi
+          SJ_COUNT=$(grep -c "\"version\": \"$PY_VERSION\"" server.json || true)
+          if [ "$SJ_COUNT" -ne 2 ]; then
+            echo "::error::server.json must carry version $PY_VERSION in both fields (found $SJ_COUNT)"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            if [ "$PY_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::tag v$TAG_VERSION does not match pyproject version $PY_VERSION"
+              exit 1
+            fi
+          fi
+          echo "version=$PY_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing $PY_VERSION"
+
+      - name: Tests and lint
+        run: |
+          uv sync --all-extras
+          uv run pytest -q
+          uv run ruff check src/ tests/ scripts/
+          uv run ruff format --check src/ tests/ scripts/
+
+      - name: Build
+        run: uv build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi # release tags only; PyPI accepts no other job
+    permissions:
+      id-token: write # lets GitHub vouch for this job to PyPI
+
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      # Only for `uv publish`. No cache: a cache restored into a job that holds
+      # a publish token is a way in for whoever last wrote that cache.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+
+      # No token. PyPI trusted publishing verifies this repo and workflow via
+      # OIDC. --check-url makes a re-run skip files already uploaded instead of
+      # failing on a duplicate.
+      - name: Publish to PyPI
+        run: |
+          uv publish \
+            --trusted-publishing always \
+            --check-url https://pypi.org/simple/outlook-graph-mcp/
+
+  registry:
+    needs: [build, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # lets GitHub vouch for this job to the MCP registry
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The registry refuses a version it cannot find on PyPI, and PyPI's index
+      # lags its own upload by up to a couple of minutes. Wait rather than race.
+      - name: Wait for PyPI to serve the new version
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              "https://pypi.org/pypi/outlook-graph-mcp/$VERSION/json")
+            if [ "$CODE" = "200" ]; then
+              echo "PyPI is serving $VERSION"
+              exit 0
+            fi
+            echo "attempt $i: PyPI returned $CODE — waiting 10s"
+            sleep 10
+          done
+          echo "::error::PyPI never served $VERSION after 5 minutes"
+          exit 1
+
+      # Pinned and checksum-verified: this job can publish, so nothing it has
+      # not verified runs in it. The script says how to move the pin; CI runs
+      # the same script on every push.
+      - name: Install mcp-publisher
+        run: scripts/install-mcp-publisher.sh
+
+      # Replaces `mcp-publisher login github`, which needs a browser and issues
+      # a token that expires five minutes later.
+      - name: Publish to the MCP registry
+        run: |
+          ./mcp-publisher login github-oidc
+          # The registry rejects a duplicate version, which would turn the
+          # documented retry (`gh workflow run publish.yml --ref vX.Y.Z`) red
+          # after a run that already succeeded. Treat "already published" as done — the
+          # same idempotence --check-url gives the PyPI step above.
+          set +e
+          OUT=$(./mcp-publisher publish 2>&1)
+          CODE=$?
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            if echo "$OUT" | grep -q "cannot publish duplicate version"; then
+              echo "Already in the registry at this version — nothing to do."
+              exit 0
+            fi
+            exit "$CODE"
+          fi
+
+      - name: Summary
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          {
+            echo "### Published $VERSION"
+            echo ""
+            echo "- PyPI: https://pypi.org/project/outlook-graph-mcp/$VERSION/"
+            echo "- MCP registry: io.github.mpalermiti/outlook-mcp"
+            echo ""
+            echo "Still manual: \`clawhub publish \"\$(pwd)\" --version $VERSION --tags latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

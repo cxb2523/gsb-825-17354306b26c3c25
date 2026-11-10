@@ -1,0 +1,970 @@
+"""Mail read tools: list_inbox, read_message, read_messages, search_mail, list_folders."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from outlook_mcp import sender_auth
+from outlook_mcp.errors import graph_json
+from outlook_mcp.folder_resolver import (
+    fetch_all_top_level_folders,
+    resolve_folder_id,
+    walk_folder_tree,
+)
+from outlook_mcp.pagination import (
+    apply_pagination,
+    build_request_config,
+    decode_cursor_payload,
+    encode_cursor_payload,
+    get_page,
+    wrap_nextlink,
+)
+from outlook_mcp.throttle import retry_throttled_subrequests, send_with_retry
+from outlook_mcp.validation import (
+    sanitize_kql,
+    sanitize_output,
+    strip_html_control_characters,
+    validate_datetime,
+    validate_email,
+    validate_graph_id,
+    validate_internet_message_id,
+)
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0/"
+GRAPH_TOKEN_SCOPE = "https://graph.microsoft.com/.default"
+BATCH_URL = GRAPH_BASE + "$batch"
+MAX_BATCH_SIZE = 20
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+# Fields stripped from the message-summary dict when ``concise=True``.
+# Kept in sync with the docstrings on ``outlook_list_inbox`` /
+# ``outlook_search_mail``.
+_CONCISE_SUMMARY_DROP = ("preview", "categories")
+
+
+def _concise_summary(summary: dict) -> dict:
+    """Return a copy of a message-summary dict with bulky fields stripped."""
+    return {k: v for k, v in summary.items() if k not in _CONCISE_SUMMARY_DROP}
+
+
+# Every field ``_format_message_summary`` reads, in one place. It used to be
+# copy-pasted into each of the four call sites, and they drifted: only
+# ``list_inbox`` selected ``inferenceClassification``, so ``search_mail``,
+# ``list_drafts`` and ``get_thread`` returned ``"classification": ""`` for
+# every message no matter what Focused Inbox had decided. A $select narrower
+# than its formatter is a silent lie — the caller cannot tell "not classified"
+# from "we forgot to ask".
+SUMMARY_SELECT = (
+    "id,subject,from,receivedDateTime,isRead,importance,"
+    "bodyPreview,hasAttachments,categories,flag,conversationId,inferenceClassification"
+)
+
+
+# The read tools' `$select` for `include_sender_auth` (#130). Graph returns
+# `internetMessageHeaders` only when `$select` names it, and once `$select` names
+# anything Graph returns only what it names, so this names every property the
+# read formatters read as well. It is sent only on that opt-in: the default read sends
+# no `$select` and stays exactly what it was. `attachments` is not here: it is a
+# relationship, which Graph returns only for `$expand`, and the default read does
+# not expand it either. `test_select_covers_the_formatter.py` pins the list
+# against both formatters.
+_SENDER_AUTH_SELECT = (
+    "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,isRead,"
+    "importance,hasAttachments,categories,flag,conversationId,internetMessageHeaders"
+)
+
+
+def _format_message_summary(msg: Any) -> dict:
+    """Convert Graph SDK message to summary dict.
+
+    Module-level helper — also imported by thread tools (Tier 2).
+    """
+    from_addr = ""
+    from_name = ""
+    if msg.from_ and msg.from_.email_address:
+        from_addr = msg.from_.email_address.address or ""
+        from_name = msg.from_.email_address.name or ""
+
+    flag_status = "notFlagged"
+    if msg.flag and msg.flag.flag_status:
+        flag_status = (
+            msg.flag.flag_status.value
+            if hasattr(msg.flag.flag_status, "value")
+            else str(msg.flag.flag_status)
+        )
+
+    importance = "normal"
+    if msg.importance:
+        importance = (
+            msg.importance.value if hasattr(msg.importance, "value") else str(msg.importance)
+        )
+
+    classification = ""
+    ic = getattr(msg, "inference_classification", None)
+    if ic:
+        classification = ic.value if hasattr(ic, "value") else str(ic)
+
+    return {
+        "id": msg.id,
+        "subject": sanitize_output(msg.subject or "(no subject)"),
+        "from_email": from_addr,
+        "from_name": sanitize_output(from_name),
+        "received": str(msg.received_date_time or ""),
+        "is_read": bool(msg.is_read),
+        "importance": importance,
+        "preview": sanitize_output(msg.body_preview or ""),
+        "has_attachments": bool(msg.has_attachments),
+        "categories": list(msg.categories or []),
+        "flag": flag_status,
+        "conversation_id": msg.conversation_id or "",
+        "classification": classification,
+    }
+
+
+VALID_CLASSIFICATIONS = {"focused", "other"}
+
+# Graph rejects `$orderby=receivedDateTime` combined with a `$filter` on any other
+# property (400 InefficientFilter) unless a receivedDateTime clause comes FIRST in
+# the filter. Presence alone is not enough — clause order is load-bearing, verified
+# live: the same clauses with receivedDateTime second still 400. When the caller
+# supplies no after/before we prepend this permissive floor to satisfy the index.
+# 1900-01-01 is a readable floor that predates any real mail item; mailbox $count is
+# identical with and without it. See https://devblogs.microsoft.com/microsoft365dev/
+# update-to-filtering-and-sorting-rest-api/
+RECEIVED_FLOOR = "1900-01-01T00:00:00Z"
+
+
+async def list_inbox(
+    graph_client: Any,
+    folder: str = "inbox",
+    count: int = 25,
+    unread_only: bool = False,
+    from_address: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    skip: int = 0,
+    cursor: str | None = None,
+    classification: str | None = None,
+    concise: bool = False,
+    uncategorized_only: bool = False,
+    timezone: str = "UTC",
+) -> dict:
+    """List messages in a folder.
+
+    classification: filter by Focused Inbox classification — "focused" or "other".
+    None means no filter (both).
+
+    uncategorized_only: when True, filter to only messages with no categories assigned
+    (uses OData ``not categories/any()``). Default False.
+
+    timezone: IANA zone that zone-less ``after``/``before`` values are interpreted in.
+    Defaults to UTC; the server passes ``config.timezone``.
+
+    concise: when True, drop ``preview`` and ``categories`` from each message
+    (smaller payload for triage scans). Default False preserves the existing shape.
+    """
+    count = _clamp(count, 1, 100)
+    folder = await resolve_folder_id(graph_client, folder)
+
+    query_params = apply_pagination({}, count, cursor)
+    query_params["$orderby"] = "receivedDateTime desc"
+    query_params["$select"] = SUMMARY_SELECT
+
+    # If cursor provided, it already set $skip — ignore the manual skip param
+    if not cursor and skip:
+        query_params["$skip"] = skip
+
+    # Build filter with validated inputs. Clauses are validated in signature order
+    # (so validation errors keep their existing precedence) but emitted with the
+    # receivedDateTime clauses first — see RECEIVED_FLOOR.
+    date_filters: list[str] = []
+    other_filters: list[str] = []
+    if unread_only:
+        other_filters.append("isRead eq false")
+    if from_address:
+        validate_email(from_address)
+        safe_from = from_address.replace("'", "''")
+        other_filters.append(f"from/emailAddress/address eq '{safe_from}'")
+    if after:
+        safe_after = validate_datetime(after, timezone)
+        date_filters.append(f"receivedDateTime ge {safe_after}")
+    if before:
+        safe_before = validate_datetime(before, timezone)
+        date_filters.append(f"receivedDateTime le {safe_before}")
+    if classification is not None:
+        if classification not in VALID_CLASSIFICATIONS:
+            raise ValueError(
+                f"Invalid classification '{classification}'. "
+                f"Must be one of: {sorted(VALID_CLASSIFICATIONS)}"
+            )
+        other_filters.append(f"inferenceClassification eq '{classification}'")
+    if uncategorized_only:
+        other_filters.append("not categories/any()")
+
+    # $orderby is unconditionally `receivedDateTime desc`, so any non-date clause
+    # needs a leading receivedDateTime clause. A caller-supplied after/before
+    # already satisfies that — don't double-add.
+    if other_filters and not date_filters:
+        date_filters.append(f"receivedDateTime ge {RECEIVED_FLOOR}")
+
+    filters = date_filters + other_filters
+    if filters:
+        query_params["$filter"] = " and ".join(filters)
+
+    from msgraph.generated.users.item.mail_folders.item.messages.messages_request_builder import (
+        MessagesRequestBuilder,
+    )
+
+    req_config = build_request_config(
+        MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters, query_params
+    )
+    response = await graph_client.me.mail_folders.by_mail_folder_id(folder).messages.get(
+        request_configuration=req_config
+    )
+
+    messages = [_format_message_summary(m) for m in (response.value or [])]
+    if concise:
+        messages = [_concise_summary(m) for m in messages]
+
+    return {
+        "messages": messages,
+        "count": len(messages),
+        "has_more": response.odata_next_link is not None,
+        "cursor": wrap_nextlink(response.odata_next_link),
+    }
+
+
+def _format_read_message_from_sdk(
+    msg: Any,
+    format: str,
+    concise: bool,
+    deferred_value: str | None,
+    include_deferred_send: bool,
+    include_sender_auth: bool = False,
+) -> dict:
+    """Build the ``read_message`` wire shape from an SDK ``Message`` object.
+
+    Module-private — extracted from ``read_message`` so the bulk-read tool
+    (``read_messages``) can share the same body / preview / sanitization
+    logic via the ``_format_read_message_from_raw`` adapter below.
+    """
+    from_addr = ""
+    from_name = ""
+    if msg.from_ and msg.from_.email_address:
+        from_addr = msg.from_.email_address.address or ""
+        from_name = msg.from_.email_address.name or ""
+
+    to_list = []
+    for r in msg.to_recipients or []:
+        if r.email_address:
+            to_list.append(
+                {
+                    "name": sanitize_output(r.email_address.name or ""),
+                    "email": r.email_address.address or "",
+                }
+            )
+
+    cc_list = []
+    for r in msg.cc_recipients or []:
+        if r.email_address:
+            cc_list.append(
+                {
+                    "name": sanitize_output(r.email_address.name or ""),
+                    "email": r.email_address.address or "",
+                }
+            )
+
+    body_text = ""
+    body_html = None
+    if msg.body:
+        content = msg.body.content or ""
+        if format in ("html", "full"):
+            body_html = strip_html_control_characters(content)
+        if format in ("text", "full"):
+            body_text = sanitize_output(content, multiline=True)
+
+    attachments = []
+    for att in msg.attachments or []:
+        attachments.append(
+            {
+                "id": att.id,
+                "name": sanitize_output(att.name or ""),
+                "size": att.size or 0,
+            }
+        )
+
+    importance = "normal"
+    if msg.importance and hasattr(msg.importance, "value"):
+        importance = msg.importance.value
+
+    flag_status = "notFlagged"
+    if msg.flag and msg.flag.flag_status and hasattr(msg.flag.flag_status, "value"):
+        flag_status = msg.flag.flag_status.value
+
+    result = {
+        "id": msg.id,
+        "subject": sanitize_output(msg.subject or "(no subject)"),
+        "from_email": from_addr,
+        "from_name": sanitize_output(from_name),
+        "to": to_list,
+        "cc": cc_list,
+        "received": str(msg.received_date_time or ""),
+        "body": body_text,
+        "body_html": body_html,
+        "is_read": bool(msg.is_read),
+        "importance": importance,
+        "has_attachments": bool(msg.has_attachments),
+        "attachments": attachments,
+        "categories": list(msg.categories or []),
+        "flag": flag_status,
+        "conversation_id": msg.conversation_id or "",
+    }
+
+    if concise:
+        # Surface a compact preview drawn from whichever body content we have.
+        preview_source = msg.body.content if msg.body and msg.body.content else ""
+        result.pop("body", None)
+        result.pop("body_html", None)
+        result["body_preview"] = _make_body_preview(preview_source)
+
+    if include_deferred_send:
+        result["deferred_send_datetime"] = deferred_value
+
+    if include_sender_auth:
+        headers = [(h.name or "", h.value or "") for h in msg.internet_message_headers or []]
+        result["sender_authentication"] = sender_auth.sender_authentication(headers, from_addr)
+
+    return result
+
+
+def _format_read_message_from_raw(
+    raw: dict,
+    format: str,
+    concise: bool,
+    include_deferred_send: bool,
+    include_sender_auth: bool = False,
+) -> dict:
+    """Build the ``read_message`` wire shape from a raw Graph JSON dict.
+
+    Used by the bulk-read tool (``read_messages``) which goes through
+    Graph's ``$batch`` endpoint via raw httpx — the SDK ``Message`` object
+    isn't available there. Output is byte-identical to
+    ``_format_read_message_from_sdk`` for the same input message.
+
+    Mirrors ``mail_delta._format_message_delta`` in spirit (dict-shape
+    Graph response → outlook-mcp wire shape).
+    """
+    fa = raw.get("from") or {}
+    from_ea = fa.get("emailAddress") or {}
+    from_addr = from_ea.get("address") or ""
+    from_name = from_ea.get("name") or ""
+
+    to_list = []
+    for r in raw.get("toRecipients") or []:
+        ea = (r or {}).get("emailAddress") or {}
+        to_list.append(
+            {
+                "name": sanitize_output(ea.get("name") or ""),
+                "email": ea.get("address") or "",
+            }
+        )
+
+    cc_list = []
+    for r in raw.get("ccRecipients") or []:
+        ea = (r or {}).get("emailAddress") or {}
+        cc_list.append(
+            {
+                "name": sanitize_output(ea.get("name") or ""),
+                "email": ea.get("address") or "",
+            }
+        )
+
+    body = raw.get("body") or {}
+    content = body.get("content") or ""
+    body_text = ""
+    body_html = None
+    if format in ("html", "full"):
+        body_html = strip_html_control_characters(content)
+    if format in ("text", "full"):
+        body_text = sanitize_output(content, multiline=True)
+
+    attachments = []
+    for att in raw.get("attachments") or []:
+        attachments.append(
+            {
+                "id": att.get("id"),
+                "name": sanitize_output(att.get("name") or ""),
+                "size": att.get("size") or 0,
+            }
+        )
+
+    flag_status = "notFlagged"
+    flag_node = raw.get("flag")
+    if isinstance(flag_node, dict):
+        flag_status = flag_node.get("flagStatus") or "notFlagged"
+
+    result = {
+        "id": raw.get("id"),
+        "subject": sanitize_output(raw.get("subject") or "(no subject)"),
+        "from_email": from_addr,
+        "from_name": sanitize_output(from_name),
+        "to": to_list,
+        "cc": cc_list,
+        "received": str(raw.get("receivedDateTime") or ""),
+        "body": body_text,
+        "body_html": body_html,
+        "is_read": bool(raw.get("isRead")),
+        "importance": raw.get("importance") or "normal",
+        "has_attachments": bool(raw.get("hasAttachments")),
+        "attachments": attachments,
+        "categories": list(raw.get("categories") or []),
+        "flag": flag_status,
+        "conversation_id": raw.get("conversationId") or "",
+    }
+
+    if concise:
+        result.pop("body", None)
+        result.pop("body_html", None)
+        result["body_preview"] = _make_body_preview(content)
+
+    if include_deferred_send:
+        from outlook_mcp.tools.mail_drafts import _PR_DEFERRED_SEND_TIME_ID
+
+        # Graph normalizes the property tag's hex segment to lowercase
+        # in the response (matches the SDK path in ``read_message``).
+        target = _PR_DEFERRED_SEND_TIME_ID.lower()
+        deferred_value: str | None = None
+        for prop in raw.get("singleValueExtendedProperties") or []:
+            if ((prop or {}).get("id") or "").lower() == target:
+                deferred_value = prop.get("value")
+                break
+        result["deferred_send_datetime"] = deferred_value
+
+    if include_sender_auth:
+        headers = [
+            ((h or {}).get("name") or "", (h or {}).get("value") or "")
+            for h in raw.get("internetMessageHeaders") or []
+        ]
+        result["sender_authentication"] = sender_auth.sender_authentication(headers, from_addr)
+
+    return result
+
+
+# Graph returns a body in the type it was stored in, usually HTML, unless the
+# request says otherwise (#124). ``text`` and a concise read (whose only body
+# output is ``body_preview``) ask for text, so the model gets no markup: tags,
+# attributes, comments and ``<style>`` go. Text hidden only by styling
+# (``display:none``) may still be rendered, so the body stays untrusted.
+# ``html`` and ``full`` keep the stored body, less the ANSI escapes and C0/C1
+# controls the text form also loses. Graph converts once, server side, and
+# nothing here parses HTML.
+_TEXT_BODY_PREFER = 'outlook.body-content-type="text"'
+
+
+def _wants_text_body(format: str, concise: bool) -> bool:
+    return format == "text" or concise
+
+
+def _make_body_preview(content: str, limit: int = 200) -> str:
+    """Compact a body to a single-line ``body_preview`` of at most ``limit`` chars.
+
+    Drops control characters via ``sanitize_output``, then collapses whitespace
+    (newlines, tabs, runs of spaces) into single spaces. It does not strip HTML:
+    the reads that preview a body ask Graph for its text (``_TEXT_BODY_PREFER``).
+    """
+    plain = sanitize_output(content or "", multiline=True)
+    collapsed = " ".join(plain.split())
+    return collapsed[:limit]
+
+
+async def resolve_message_id(graph_client: Any, message_id: str) -> str:
+    """The Graph id for ``message_id``: a Graph id, or a Message-ID header value.
+
+    A value with an ``@`` is a Message-ID (no Graph id can contain one) and is
+    looked up with an exact ``$filter`` on ``internetMessageId``, selecting only
+    the id. Every copy of a message shares its Message-ID (the Inbox copy of a
+    message sent to yourself and the Sent Items one, or a copied message), so
+    more than one match is refused with the ids rather than guessed between.
+    """
+    if "@" not in message_id:
+        return validate_graph_id(message_id)
+    internet_message_id = validate_internet_message_id(message_id)
+    literal = internet_message_id.replace("'", "''")
+
+    from msgraph.generated.users.item.messages.messages_request_builder import (
+        MessagesRequestBuilder,
+    )
+
+    from outlook_mcp.errors import NotFoundError
+
+    response = await graph_client.me.messages.get(
+        request_configuration=build_request_config(
+            MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters,
+            {"$filter": f"internetMessageId eq '{literal}'", "$select": "id", "$top": 10},
+        )
+    )
+    ids = [m.id for m in (response.value or []) if m.id]
+    shown = sanitize_output(internet_message_id[:120])
+    if not ids:
+        raise NotFoundError("Message with Message-ID", shown)
+    if len(ids) > 1:
+        raise ValueError(
+            f"Message-ID {shown} matches {len(ids)} messages, copies in different "
+            f"folders: {', '.join(ids)}. Read one by its id."
+        )
+    return ids[0]
+
+
+async def read_message(
+    graph_client: Any,
+    message_id: str,
+    format: str = "text",
+    include_deferred_send: bool = False,
+    concise: bool = False,
+    include_sender_auth: bool = False,
+) -> dict:
+    """Read a single message by ID, or by its Message-ID (see ``resolve_message_id``).
+
+    Pass ``include_deferred_send=True`` to surface the
+    PR_DEFERRED_SEND_TIME extended property (the value Exchange reads to
+    schedule deferred delivery) as ``deferred_send_datetime`` in the
+    response. ``null`` if the property isn't set on the message.
+
+    Pass ``concise=True`` to drop the full ``body`` / ``body_html`` fields
+    and surface a single-line ``body_preview`` (first 200 chars, whitespace
+    collapsed). Headers (from/to/cc/subject/received/importance/...) are
+    preserved. Default False keeps the existing shape.
+
+    Pass ``include_sender_auth=True`` to add ``sender_authentication``,
+    Microsoft's verdict on the From domain (``sender_auth``). It selects
+    ``internetMessageHeaders``, which Graph returns only when asked for.
+    """
+    message_id = await resolve_message_id(graph_client, message_id)
+
+    deferred_value: str | None = None
+    text_body = _wants_text_body(format, concise)
+
+    if include_deferred_send:
+        # PR_DEFERRED_SEND_TIME extended property fetch.
+        #
+        # Kiota's typed query-parameter encoder drops the inner
+        # `$filter` from `$expand=singleValueExtendedProperties($filter=...)`
+        # during URL building, so we build a raw URL via the
+        # RAW_URL_KEY path-parameter slot and let the adapter execute it
+        # through the normal auth + retry pipeline.
+        from urllib.parse import quote
+
+        from kiota_abstractions.method import Method
+        from kiota_abstractions.request_information import RequestInformation
+        from msgraph.generated.models.message import Message
+        from msgraph.generated.models.o_data_errors.o_data_error import ODataError
+
+        from outlook_mcp.tools.mail_drafts import _PR_DEFERRED_SEND_TIME_ID
+
+        adapter = graph_client.me.messages.by_message_id(message_id).request_adapter
+        filter_expr = f"id eq '{_PR_DEFERRED_SEND_TIME_ID}'"
+        # Keep `=`, space, and single quotes literal — Graph requires
+        # them in the $filter clause and they're safe inside a query
+        # parameter value. Hex/special chars in the property tag still
+        # get percent-encoded.
+        encoded_filter = quote(filter_expr, safe="= '")
+        raw_url = (
+            f"{adapter.base_url}/me/messages/{quote(message_id, safe='')}"
+            f"?$expand=singleValueExtendedProperties("
+            f"$filter={encoded_filter})"
+        )
+        if include_sender_auth:
+            raw_url += f"&$select={_SENDER_AUTH_SELECT}"
+
+        info = RequestInformation()
+        info.http_method = Method.GET
+        info.path_parameters = {RequestInformation.RAW_URL_KEY: raw_url}
+        info.url_template = "{+baseurl}"
+        info.headers.try_add("Accept", "application/json")
+        if text_body:
+            info.headers.try_add("Prefer", _TEXT_BODY_PREFER)
+        msg = await adapter.send_async(
+            info,
+            Message,
+            {
+                "4XX": ODataError,
+                "5XX": ODataError,
+            },
+        )
+
+        # Graph normalizes the property tag's hex segment to lowercase
+        # in the response (`SystemTime 0x3fef`), even when we POST/PATCH
+        # it as uppercase. Case-insensitive match.
+        target = _PR_DEFERRED_SEND_TIME_ID.lower()
+        for prop in msg.single_value_extended_properties or []:
+            if (prop.id or "").lower() == target:
+                deferred_value = prop.value
+                break
+    elif include_sender_auth:
+        from msgraph.generated.users.item.messages.item.message_item_request_builder import (
+            MessageItemRequestBuilder,
+        )
+
+        req_config = build_request_config(
+            MessageItemRequestBuilder.MessageItemRequestBuilderGetQueryParameters,
+            {"$select": _SENDER_AUTH_SELECT},
+        )
+        if text_body:
+            req_config.headers.add("Prefer", _TEXT_BODY_PREFER)
+        msg = await graph_client.me.messages.by_message_id(message_id).get(
+            request_configuration=req_config
+        )
+    elif text_body:
+        from kiota_abstractions.base_request_configuration import RequestConfiguration
+
+        req_config = RequestConfiguration()
+        req_config.headers.add("Prefer", _TEXT_BODY_PREFER)
+        msg = await graph_client.me.messages.by_message_id(message_id).get(
+            request_configuration=req_config
+        )
+    else:
+        msg = await graph_client.me.messages.by_message_id(message_id).get()
+
+    return _format_read_message_from_sdk(
+        msg, format, concise, deferred_value, include_deferred_send, include_sender_auth
+    )
+
+
+def _build_read_subrequest_url(
+    message_id: str, include_deferred_send: bool, include_sender_auth: bool = False
+) -> str:
+    """Build the per-sub-request URL path for ``read_messages``.
+
+    Matches what ``read_message`` requests:
+
+    - Default: ``/me/messages/{id}`` (all default fields).
+    - ``include_deferred_send=True``: adds the singleValueExtendedProperties
+      expansion filtered to ``PR_DEFERRED_SEND_TIME``, same as the raw URL
+      ``read_message`` builds via Kiota's ``RAW_URL_KEY`` path.
+    - ``include_sender_auth=True``: adds ``$select=_SENDER_AUTH_SELECT``.
+    """
+    safe_id = quote(message_id, safe="")
+    query = []
+    if include_deferred_send:
+        from outlook_mcp.tools.mail_drafts import _PR_DEFERRED_SEND_TIME_ID
+
+        filter_expr = f"id eq '{_PR_DEFERRED_SEND_TIME_ID}'"
+        # Match ``read_message``: keep ``= '`` literal, percent-encode the rest.
+        encoded_filter = quote(filter_expr, safe="= '")
+        query.append(f"$expand=singleValueExtendedProperties($filter={encoded_filter})")
+    if include_sender_auth:
+        query.append(f"$select={_SENDER_AUTH_SELECT}")
+    return f"/me/messages/{safe_id}" + ("?" + "&".join(query) if query else "")
+
+
+async def read_messages(
+    graph_client: Any,
+    message_ids: list[str],
+    format: str = "text",
+    concise: bool = False,
+    include_deferred_send: bool = False,
+    include_sender_auth: bool = False,
+) -> dict:
+    """Read up to 20 messages by ID in a single Graph ``$batch`` round-trip.
+
+    Replaces N sequential ``read_message`` calls with one HTTP request.
+    Each per-message entry in ``messages`` matches what ``read_message``
+    returns for the same ``(format, concise, include_deferred_send)``
+    combo, byte-for-byte. Ordering follows the input ``message_ids``
+    list, not Graph's response order.
+
+    Args:
+        graph_client: A ``GraphClient`` instance. Needs ``credential`` for
+            bearer-token minting (the SDK client isn't used here — raw
+            httpx hits the ``$batch`` endpoint directly).
+        message_ids: 1-20 Graph message IDs. Each is validated via
+            ``validate_graph_id`` before the HTTP call.
+        format: ``"text"`` (default), ``"html"``, or ``"full"`` — same
+            semantics as ``read_message``.
+        concise: When True, drop ``body``/``body_html`` per the v1.8.0
+            concise contract; surface a single-line ``body_preview``.
+        include_deferred_send: When True, fetch the
+            PR_DEFERRED_SEND_TIME extended property on each message and
+            surface it as ``deferred_send_datetime``.
+        include_sender_auth: When True, select each message's
+            ``internetMessageHeaders`` and surface Microsoft's verdict on its
+            From domain as ``sender_authentication``.
+
+    Returns:
+        ``{messages, failures, requested, succeeded, failed}`` where
+        ``messages`` is the list of read_message-shaped dicts in input
+        order (failed IDs skipped), and ``failures`` is a list of
+        ``{id, status, code, message}`` for sub-requests that didn't
+        return 2xx. Input-validation errors raise ``ValueError``;
+        transport-level errors raise ``httpx.HTTPStatusError`` (a 5xx on
+        the whole batch is *not* a partial failure), and a reply that is
+        not a JSON object raises ``GraphAPIError``.
+    """
+    if not message_ids:
+        raise ValueError("message_ids must not be empty")
+    if len(message_ids) > MAX_BATCH_SIZE:
+        raise ValueError(f"Maximum {MAX_BATCH_SIZE} messages per batch (Graph API limit)")
+
+    # Fail fast on malformed IDs *before* any HTTP work.
+    for mid in message_ids:
+        validate_graph_id(mid)
+
+    credential = graph_client.credential
+
+    subrequests = []
+    for i, mid in enumerate(message_ids):
+        sub = {
+            "id": str(i),
+            "method": "GET",
+            "url": _build_read_subrequest_url(mid, include_deferred_send, include_sender_auth),
+        }
+        # A $batch sub-request carries its own headers.
+        if _wants_text_body(format, concise):
+            sub["headers"] = {"Prefer": _TEXT_BODY_PREFER}
+        subrequests.append(sub)
+
+    tok = credential.get_token(GRAPH_TOKEN_SCOPE)
+    headers = {
+        "Authorization": f"Bearer {tok.token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        # A $batch response carries up to 20 messages; httpx decompresses it.
+        "Accept-Encoding": "gzip",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+
+        async def _post_batch(reqs: list[dict]) -> dict:
+            # Envelope retry (429/503 on the whole $batch) via send_with_retry;
+            # a genuine transport error (e.g. 500) still raises.
+            resp = await send_with_retry(
+                client,
+                "POST",
+                BATCH_URL,
+                headers=headers,
+                content=json.dumps({"requests": reqs}),
+            )
+            resp.raise_for_status()
+            return graph_json(resp)
+
+        # $batch returns HTTP 200 even when individual sub-requests are
+        # throttled (429/503). retry_throttled_subrequests re-issues just the
+        # throttled sub-requests with Retry-After instead of recording them as
+        # permanent failures. Graph's response order isn't trusted; we keyed
+        # each sub-request by its input index, so this returns an id->sub map.
+        responses_by_id = await retry_throttled_subrequests(_post_batch, subrequests)
+
+    messages: list[dict] = []
+    failures: list[dict] = []
+
+    for i, mid in enumerate(message_ids):
+        sub = responses_by_id.get(str(i))
+        if sub is None:
+            failures.append(
+                {
+                    "id": mid,
+                    "status": 0,
+                    "code": "NoResponse",
+                    "message": "no sub-response returned by Graph for this id",
+                }
+            )
+            continue
+
+        status = sub.get("status", 0)
+        body = sub.get("body") or {}
+
+        if 200 <= status < 300:
+            messages.append(
+                _format_read_message_from_raw(
+                    body, format, concise, include_deferred_send, include_sender_auth
+                )
+            )
+        else:
+            err = body.get("error") or {}
+            failures.append(
+                {
+                    "id": mid,
+                    "status": status,
+                    "code": err.get("code") or "",
+                    "message": err.get("message") or "",
+                }
+            )
+
+    return {
+        "messages": messages,
+        "failures": failures,
+        "requested": len(message_ids),
+        "succeeded": len(messages),
+        "failed": len(failures),
+    }
+
+
+# Graph ends a message `$search` a little past 250 results, whatever `$top`
+# asks for, and says nothing: the last page has no @odata.nextLink, exactly
+# like the end of a complete search. Measured 2026-10-23 on an Exchange Online
+# mailbox, three queries that each matched tens of thousands of messages: 275
+# results for `$top` from 25 to 1000, 260 for 10, 255 for 5, never 250 or
+# fewer. (Graph's documentation says up to 1,000.) So a search that ends past
+# 250 is reported as possibly cut short. One that genuinely matched 251-275
+# messages reads the same, which only costs the caller a narrower search.
+SEARCH_STOPS_AFTER = 250
+
+
+async def search_mail(
+    graph_client: Any,
+    query: str,
+    count: int = 25,
+    folder: str | None = None,
+    cursor: str | None = None,
+    concise: bool = False,
+) -> dict:
+    """Search mail using KQL.
+
+    concise: when True, drop ``preview`` and ``categories`` from each message
+    (smaller payload for triage scans). Default False preserves the existing shape.
+
+    Graph pages a ``$search`` only with ``$skiptoken``, which ``get_page``
+    sends. A cursor continues the search it came from: the folder is stored in
+    it, so a later page neither re-resolves the name nor drifts to another
+    folder (or to all mail) when the argument is omitted or changed.
+
+    The cursor also counts the results served so far, so the last page of a
+    search that ends past ``SEARCH_STOPS_AFTER`` carries ``incomplete``: a
+    note saying older matches may be missing and how to reach them. A search
+    that ends at or below it has no such key.
+    """
+    count = _clamp(count, 1, 100)
+    safe_query = sanitize_kql(query)
+
+    # Decode before any network call, so a bad cursor is refused for free:
+    # `apply_pagination` refuses a `skiptoken` that is not a non-empty string.
+    payload = decode_cursor_payload(cursor) if cursor else {}
+    served = payload.get("served", 0)
+    if not isinstance(served, int) or isinstance(served, bool) or served < 0:
+        raise ValueError("Invalid pagination cursor")
+    query_params = apply_pagination({}, count, cursor)
+    query_params["$search"] = safe_query
+    query_params["$select"] = SUMMARY_SELECT
+
+    if "folder" in payload:
+        # Caller-held state that goes into a URL path: validate, never trust.
+        folder_id = payload["folder"]
+        if folder_id is not None:
+            if not isinstance(folder_id, str):
+                raise ValueError("Invalid pagination cursor")
+            folder_id = validate_graph_id(folder_id)
+    elif folder:
+        folder_id = await resolve_folder_id(graph_client, folder)
+    else:
+        folder_id = None
+
+    if folder_id is not None:
+        from msgraph.generated.users.item.mail_folders.item.messages import (
+            messages_request_builder as folder_mrb,
+        )
+
+        response = await get_page(
+            graph_client.me.mail_folders.by_mail_folder_id(folder_id).messages,
+            folder_mrb.MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters,
+            query_params,
+        )
+    else:
+        from msgraph.generated.users.item.messages.messages_request_builder import (
+            MessagesRequestBuilder as MeMessagesRequestBuilder,
+        )
+
+        response = await get_page(
+            graph_client.me.messages,
+            MeMessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters,
+            query_params,
+        )
+
+    messages = [_format_message_summary(m) for m in (response.value or [])]
+    if concise:
+        messages = [_concise_summary(m) for m in messages]
+    served += len(messages)
+
+    next_cursor = wrap_nextlink(response.odata_next_link)
+    if next_cursor is not None:
+        # Pin the folder into the cursor (None = all mail), so the next page is
+        # unambiguously a continuation of this search.
+        next_cursor = encode_cursor_payload(
+            {**decode_cursor_payload(next_cursor), "folder": folder_id, "served": served}
+        )
+
+    result = {
+        "messages": messages,
+        "count": len(messages),
+        "has_more": response.odata_next_link is not None,
+        "cursor": next_cursor,
+    }
+    if response.odata_next_link is None and served > SEARCH_STOPS_AFTER:
+        result["incomplete"] = (
+            f"This search ended at {served} results with no next page. Graph has been seen to "
+            "stop a search around 275 without saying so, so older matches may be missing: "
+            "add received<= with the last message's date to the query to reach them."
+        )
+    return result
+
+
+def _folder_to_dict(f: Any) -> dict:
+    return {
+        "id": f.id,
+        "name": sanitize_output(f.display_name or ""),
+        "total": f.total_item_count or 0,
+        "unread": f.unread_item_count or 0,
+        "parent_id": getattr(f, "parent_folder_id", None),
+        "child_count": getattr(f, "child_folder_count", 0) or 0,
+    }
+
+
+async def list_folders(
+    graph_client: Any,
+    cursor: str | None = None,
+    recursive: bool = False,
+) -> dict:
+    """List mail folders.
+
+    Default: top-level folders only, paginated. Set `recursive=True` to return
+    the full folder tree (BFS walk of subfolders) — pagination is disabled in
+    recursive mode; all folders are returned in one response.
+    """
+    from msgraph.generated.users.item.mail_folders.mail_folders_request_builder import (
+        MailFoldersRequestBuilder,
+    )
+
+    if recursive:
+        collected: list[dict] = []
+        top_level = await fetch_all_top_level_folders(graph_client)
+        async for f, path in walk_folder_tree(graph_client, top_level):
+            # The form resolve_folder_id takes back, "/" in a name doubled.
+            collected.append({**_folder_to_dict(f), "path": sanitize_output(path)})
+
+        return {
+            "folders": collected,
+            "count": len(collected),
+            "has_more": False,
+            "cursor": None,
+        }
+
+    query_params = apply_pagination({}, count=50, cursor=cursor)
+    req_config = build_request_config(
+        MailFoldersRequestBuilder.MailFoldersRequestBuilderGetQueryParameters, query_params
+    )
+    response = await graph_client.me.mail_folders.get(request_configuration=req_config)
+
+    folders = [_folder_to_dict(f) for f in (response.value or [])]
+    return {
+        "folders": folders,
+        "count": len(folders),
+        "has_more": response.odata_next_link is not None,
+        "cursor": wrap_nextlink(response.odata_next_link),
+    }

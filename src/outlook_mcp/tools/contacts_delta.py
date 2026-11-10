@@ -1,0 +1,152 @@
+"""Contacts delta tool: ``list_contacts_delta``.
+
+Wraps ``GET /me/contacts/delta``.
+
+Graph constraints worth knowing before reading the code:
+
+- This endpoint accepts **no query parameters at all** on the first
+  call — confirmed by a curl 400 against the live API. Page sizing is
+  via the ``Prefer: odata.maxpagesize=N`` header only.
+- Subsequent calls use the returned deltaLink / nextLink URL verbatim
+  (Graph's encoded URL is fine; we don't try to strip or augment query
+  params on it).
+
+To keep the surface predictable we just don't take any first-call query
+arguments here. There's nothing to strip and no client-side validation
+needed beyond ``page_size``.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+from urllib.parse import urljoin
+
+from outlook_mcp.tools._delta import (
+    GRAPH_BASE,
+    fetch_delta_pages,
+    format_delta_item,
+    parse_graph_datetime,
+)
+from outlook_mcp.validation import sanitize_output
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def _primary_phone_from_dict(raw: dict) -> str:
+    """Pick the most representative phone from a raw Graph contact dict.
+
+    Mirrors ``contacts._primary_phone`` — consumer Outlook accounts
+    expose ``mobilePhone`` (single), ``homePhones`` (list), and
+    ``businessPhones`` (list). Prefer mobile, then first home, then
+    first business.
+    """
+    mobile = raw.get("mobilePhone") or ""
+    if mobile:
+        return mobile
+    for key in ("homePhones", "businessPhones"):
+        values = raw.get(key) or []
+        if values:
+            return values[0]
+    return ""
+
+
+def _format_contact_delta(raw: dict) -> dict:
+    """Build the wire-shape contact summary from a raw Graph JSON contact.
+
+    Mirrors ``contacts._format_contact_summary`` field-for-field so
+    callers don't have to branch on whether a given dict came from a
+    delta call or a regular list call. That is a load-bearing claim: an
+    agent seeds from ``outlook_list_contacts`` and refreshes from this
+    tool, so a key on one side and not the other either raises KeyError
+    in the caller or — worse — reports every changed contact as
+    uncategorised. ``/me/contacts/delta`` takes no ``$select`` at all, so
+    Graph is already sending everything here; dropping a field is a
+    choice this formatter makes, not a limit of the endpoint.
+    """
+    email = ""
+    emails = raw.get("emailAddresses") or []
+    if emails:
+        email = emails[0].get("address") or ""
+
+    return {
+        "id": raw.get("id"),
+        "display_name": sanitize_output(raw.get("displayName") or ""),
+        "email": email,
+        "phone": _primary_phone_from_dict(raw),
+        "company": sanitize_output(raw.get("companyName") or ""),
+        "categories": [sanitize_output(c) for c in (raw.get("categories") or [])],
+    }
+
+
+def _changed_since(raw: dict, bound: datetime) -> bool:
+    """A tombstone, or a contact last modified at or after ``bound``.
+
+    A tombstone carries no timestamp, and a deletion is a change whenever it
+    happened. A contact whose timestamp is missing or unreadable is left out,
+    as the digest leaves out mail it cannot place in its window.
+    """
+    if "@removed" in raw:
+        return True
+    changed = parse_graph_datetime(raw.get("lastModifiedDateTime") or "")
+    return changed is not None and changed >= bound
+
+
+async def list_contacts_delta(
+    graph_client: Any,
+    page_size: int = 50,
+    delta_token: str | None = None,
+    *,
+    modified_since: datetime | None = None,
+) -> dict:
+    """List contact changes since the last delta token.
+
+    Args:
+        graph_client: A ``GraphClient`` (delta tools need the
+            ``credential`` attribute to mint raw bearer tokens).
+        page_size: Items per Graph page (1-100). Mapped to
+            ``Prefer: odata.maxpagesize=N`` — Graph rejects every other
+            query parameter on this endpoint.
+        delta_token: Opaque cursor from a previous call.
+        modified_since: Keep only contacts whose ``lastModifiedDateTime`` is at
+            or after this instant, and every tombstone. Applied here, not by
+            Graph: this endpoint takes no ``$filter``. ``outlook_changes_since``
+            passes it on a first sync, so a whole address book is not reported
+            as new; the tool itself does not take it.
+
+    Returns:
+        ``{contacts, delta_token, has_more}`` — see ``mail_delta`` for
+        full semantics. Tombstones come back as
+        ``{id, is_deleted: True}``.
+    """
+    page_size = _clamp(page_size, 1, 100)
+    credential = graph_client.credential
+
+    initial_url = ""
+    if not delta_token:
+        # /me/contacts/delta accepts no query params — Graph 400s if you
+        # even pass a $select. The page size header below is the only
+        # knob we get.
+        initial_url = urljoin(GRAPH_BASE, "me/contacts/delta")
+
+    raw_items, next_token, has_more = await fetch_delta_pages(
+        credential,
+        initial_url=initial_url,
+        delta_token=delta_token,
+        page_size=page_size,
+        resource="contacts",
+        headers={"Prefer": f"odata.maxpagesize={page_size}"},
+    )
+
+    if modified_since is not None:
+        raw_items = [item for item in raw_items if _changed_since(item, modified_since)]
+
+    contacts = [format_delta_item(item, _format_contact_delta) for item in raw_items]
+
+    return {
+        "contacts": contacts,
+        "delta_token": next_token,
+        "has_more": has_more,
+    }

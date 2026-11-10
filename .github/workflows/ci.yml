@@ -1,0 +1,206 @@
+name: CI
+on:
+  push:
+  pull_request:
+  # Mondays 14:00 UTC (~7am Pacific). See `published-install` below for why.
+  schedule:
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+# Every action is pinned to a commit SHA (tests/test_workflows_are_pinned.py);
+# Dependabot moves the pins.
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A Windows-only failure is the signal the Windows entry exists to show;
+      # don't let it cancel the Linux legs that prove it is Windows-only.
+      fail-fast: false
+      matrix:
+        # `os` must be a base key: an `include` that adds a key the base lacks is
+        # merged into the matching combination, so `os` only in the include would
+        # turn the Linux 3.12 leg into Windows instead of adding a fifth job.
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # One Windows entry, not a doubled matrix (#88). #85 and #99 were
+        # deterministic on Windows and impossible on Linux, so only a Windows
+        # runner sees that class.
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.5"
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked --all-extras
+      - run: uv run ruff check src/ tests/ scripts/
+      # `ruff check` passing says nothing about formatting: a separate tool with
+      # a separate verdict. With nothing running this, 49 of 105 files had
+      # drifted from the documented formatter (#78).
+      - run: uv run ruff format --check src/ tests/ scripts/
+      - run: uv run pytest --cov=outlook_mcp -v
+      # Opt-in tools must pass the same registry, wrapper and annotation guards
+      # as the default surface; installing parser extras alone does not load them.
+      # The rule tools are opt-in too, so the default run never registers them,
+      # and every guard that reads the registry then stops covering them.
+      - name: Test with every toolset loaded
+        # bash on every runner: the assignment below is a POSIX shell construct,
+        # and Windows defaults to PowerShell, where it fails as an unknown command.
+        shell: bash
+        run: |
+          OUTLOOK_MCP_TOOLSETS="$(uv run python -c 'from outlook_mcp import toolsets; print(",".join(sorted(set(toolsets.TOOL_GROUPS.values()))))')" \
+            uv run pytest -q
+
+  documents-macos:
+    if: github.event_name != 'schedule'
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.5"
+          python-version: "3.13"
+      - run: uv sync --locked --all-extras
+      - run: >-
+          uv run pytest tests/test_readable_attachments.py tests/test_document_paging.py
+          tests/test_document_review_guards.py tests/test_document_followups.py -v
+
+  # Guards the failure mode that shipped 1.12.0 and 1.13.0 broken for five weeks:
+  # `mcp[cli]` was declared with no upper bound, mcp 2.0.0 removed
+  # `mcp.server.fastmcp`, and every fresh `pip install` got a server that died on
+  # import. The `test` job above cannot see this — `uv sync` resolves through
+  # uv.lock, which pinned the old, working version.
+  #
+  # So this job deliberately ignores the lockfile and resolves like a real user,
+  # then imports the server from the built wheel. Any future upstream major that
+  # breaks us fails here instead of on someone's machine.
+  fresh-install:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.5"
+          python-version: "3.13"
+      - name: Build wheel
+        run: uv build
+      - name: Install from wheel with a fresh dependency resolve (no uv.lock)
+        run: |
+          uv venv "$RUNNER_TEMP/fresh"
+          uv pip install --python "$RUNNER_TEMP/fresh/bin/python" dist/*.whl
+      - name: Report resolved dependency versions
+        run: |
+          "$RUNNER_TEMP/fresh/bin/python" - <<'PY'
+          import importlib.metadata as md
+          for name in ("mcp", "msgraph-sdk", "msgraph-core", "microsoft-kiota-http", "azure-identity", "pydantic"):
+              print(f"{name}=={md.version(name)}")
+          PY
+      - name: /me must reach the wire as /me (#80)
+        # The import and tool-count checks below pass on an install whose every
+        # Graph call is broken: kiota 1.13 did exactly that to 1.22.0 (#80). This
+        # sends /me through the real msgraph middleware, against whatever this
+        # lock-free resolve picked, and asserts on the URL it would put on the wire.
+        run: |
+          "$RUNNER_TEMP/fresh/bin/python" tests/test_me_rewrite_reaches_the_wire.py
+      - name: Server must import and register its full tool surface
+        run: |
+          "$RUNNER_TEMP/fresh/bin/python" - <<'PY'
+          import outlook_mcp.server as s
+          tools = [a for a in dir(s) if a.startswith("outlook_")]
+          assert len(tools) == 77, f"expected 77 tools, got {len(tools)}"
+          print(f"OK: server imports, {len(tools)} tools registered")
+          PY
+      - name: Request URLs must not be logged
+        # The server asks the MCP SDK for WARNING, and the SDK hands that to
+        # logging.basicConfig. The test job proves it against the locked SDK;
+        # this proves it against the one a new user resolves today, in a fresh
+        # process where nothing else has configured logging first.
+        run: |
+          "$RUNNER_TEMP/fresh/bin/python" - <<'PY'
+          import logging
+          import outlook_mcp.server
+          assert not logging.getLogger("httpx").isEnabledFor(logging.INFO), "httpx logs URLs at INFO"
+          print("OK: httpx request URLs are not logged")
+          PY
+      - name: CLI entrypoint must be wired and runnable
+        run: |
+          "$RUNNER_TEMP/fresh/bin/outlook-mcp" --help
+
+  # The mcp-publisher pin publish.yml installs, checked on every push: a wrong
+  # version or checksum fails here instead of halfway through a release, after
+  # PyPI has already taken the upload.
+  mcp-publisher-pin:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned mcp-publisher and verify its checksum
+        run: scripts/install-mcp-publisher.sh
+
+  # Answers the question that went unanswered for five weeks: can a new user
+  # install the *published* package today and get a server that starts?
+  #
+  # `fresh-install` above resolves dependencies like a real user, but it only
+  # runs on push — so it structurally cannot catch what actually bit us. Nothing
+  # was pushed. `mcp` 2.0.0 landed 2026-07-28, ten days after the last commit,
+  # and every install from PyPI was dead on arrival until 2026-09-03. The repo
+  # was byte-identical on both sides of the break.
+  #
+  # So this one runs on a clock instead of on a commit, and installs from PyPI
+  # rather than the working tree — which also covers a bad publish, not just a
+  # breaking upstream release.
+  #
+  # CAVEAT: GitHub disables scheduled workflows after 60 days of repository
+  # inactivity — i.e. a long enough quiet period switches off the guard that
+  # exists to cover quiet periods. GitHub emails a warning first and re-enabling
+  # is one click, so don't dismiss that mail as noise.
+  published-install:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      # Only for the /me script below — the package under test comes from PyPI.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.5"
+          python-version: "3.13"
+      - name: Install the latest published release from PyPI
+        run: |
+          uv venv "$RUNNER_TEMP/pypi"
+          uv pip install --python "$RUNNER_TEMP/pypi/bin/python" outlook-graph-mcp
+      - name: Report what a new user actually gets
+        run: |
+          "$RUNNER_TEMP/pypi/bin/python" - <<'PY'
+          import importlib.metadata as md
+          for name in ("outlook-graph-mcp", "mcp", "msgraph-sdk", "msgraph-core", "microsoft-kiota-http", "azure-identity", "pydantic"):
+              print(f"{name}=={md.version(name)}")
+          PY
+      - name: /me must reach the wire as /me (#80)
+        # Same check as fresh-install, against what PyPI serves today: catches an
+        # upstream release that breaks request routing with nothing pushed here.
+        run: |
+          "$RUNNER_TEMP/pypi/bin/python" tests/test_me_rewrite_reaches_the_wire.py
+      - name: Published server must import and register its full tool surface
+        # 77 is what the *published* release registers — not a typo for the
+        # working tree's count. Update this number only when a release ships
+        # with a different surface (see RELEASING.md).
+        run: |
+          "$RUNNER_TEMP/pypi/bin/python" - <<'PY'
+          import outlook_mcp.server as s
+          tools = [a for a in dir(s) if a.startswith("outlook_")]
+          # This asserts the count in the *published* release, not this branch's.
+          # Bump at release time to whatever PyPI is serving (77 while 1.31.x is
+          # latest) — this file is in
+          # RELEASING.md §3's lockstep
+          # list precisely so the weekly canary doesn't go permanently red the
+          # moment a release publishes.
+          assert len(tools) == 77, f"expected 77 tools, got {len(tools)}"
+          print(f"OK: published package imports, {len(tools)} tools registered")
+          PY
+      - name: CLI entrypoint must be wired and runnable
+        run: |
+          "$RUNNER_TEMP/pypi/bin/outlook-mcp" --help

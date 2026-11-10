@@ -1,0 +1,688 @@
+"""Tests for mail read tools."""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from outlook_mcp.errors import NotFoundError
+from outlook_mcp.tools.mail_read import (
+    RECEIVED_FLOOR,
+    _format_message_summary,
+    list_folders,
+    list_inbox,
+    read_message,
+    search_mail,
+)
+
+# A body that needs no cleaning: markup with attributes, an entity, CR LF and
+# tab, non-ASCII text, and zero-width and bidi characters, which real languages
+# use and the cleanup leaves alone.
+ORDINARY_HTML = (
+    '<div style="color:red">\r\n\t<p>Tab\there &amp; <b>bold</b> caf\u00e9 \u65e5\u672c'
+    "\u200b\u200d\u202e\u2066</p>\n</div>"
+)
+
+
+def _make_mock_message(**overrides):
+    """Factory for mock Graph SDK message objects."""
+    msg = MagicMock()
+    msg.id = overrides.get("id", "AAMkAG123=")
+    msg.subject = overrides.get("subject", "Test Subject")
+    msg.from_ = MagicMock()
+    msg.from_.email_address = MagicMock()
+    msg.from_.email_address.address = overrides.get("from_email", "sender@test.com")
+    msg.from_.email_address.name = overrides.get("from_name", "Sender")
+    msg.received_date_time = overrides.get("received", "2026-04-12T10:00:00Z")
+    msg.is_read = overrides.get("is_read", False)
+    msg.importance = MagicMock(value=overrides.get("importance", "normal"))
+    msg.body_preview = overrides.get("body_preview", "Preview text...")
+    msg.has_attachments = overrides.get("has_attachments", False)
+    msg.categories = overrides.get("categories", [])
+    msg.flag = MagicMock()
+    msg.flag.flag_status = MagicMock(value=overrides.get("flag", "notFlagged"))
+    msg.conversation_id = overrides.get("conversation_id", "conv123")
+    msg.inference_classification = MagicMock(value=overrides.get("classification", "focused"))
+    # Body for read_message
+    msg.body = MagicMock()
+    msg.body.content = overrides.get("body_content", "<p>Hello</p>")
+    msg.body.content_type = overrides.get("content_type", "html")
+    msg.to_recipients = overrides.get("to_recipients", [])
+    msg.cc_recipients = overrides.get("cc_recipients", [])
+    msg.attachments = overrides.get("attachments", [])
+    return msg
+
+
+def _make_folder_mock(messages, next_link=None):
+    """Build a mock Graph client for folder-based message queries.
+
+    The Graph SDK uses a synchronous fluent chain:
+        client.me.mail_folders.by_mail_folder_id("inbox").messages.get(...)
+    Only .get() is async. The intermediate methods return sync objects.
+    """
+    response = MagicMock(value=messages, odata_next_link=next_link)
+    messages_obj = MagicMock()
+    messages_obj.get = AsyncMock(return_value=response)
+    folder_obj = MagicMock()
+    folder_obj.messages = messages_obj
+    client = MagicMock()
+    client.me.mail_folders.by_mail_folder_id = MagicMock(return_value=folder_obj)
+    return client
+
+
+def _make_message_mock(msg):
+    """Build a mock Graph client for single message reads.
+
+    Chain: client.me.messages.by_message_id("id").get()
+    Only .get() is async.
+    """
+    msg_obj = MagicMock()
+    msg_obj.get = AsyncMock(return_value=msg)
+    client = MagicMock()
+    client.me.messages.by_message_id = MagicMock(return_value=msg_obj)
+    return client
+
+
+def _make_search_mock(messages, next_link=None):
+    """Build a mock Graph client for search queries (no folder).
+
+    Chain: client.me.messages.get(...)
+    """
+    response = MagicMock(value=messages, odata_next_link=next_link)
+    client = MagicMock()
+    client.me.messages.get = AsyncMock(return_value=response)
+    return client
+
+
+class TestFormatMessageSummary:
+    def test_formats_basic_message(self):
+        """_format_message_summary extracts all expected fields."""
+        msg = _make_mock_message()
+        result = _format_message_summary(msg)
+        assert result["id"] == "AAMkAG123="
+        assert result["subject"] == "Test Subject"
+        assert result["from_email"] == "sender@test.com"
+        assert result["from_name"] == "Sender"
+        assert result["is_read"] is False
+        assert result["importance"] == "normal"
+        assert result["flag"] == "notFlagged"
+        assert result["conversation_id"] == "conv123"
+
+    def test_handles_missing_from(self):
+        """Gracefully handles message with no from field."""
+        msg = _make_mock_message()
+        msg.from_ = None
+        result = _format_message_summary(msg)
+        assert result["from_email"] == ""
+        assert result["from_name"] == ""
+
+
+class TestListInbox:
+    @pytest.mark.asyncio
+    async def test_list_inbox_returns_messages(self):
+        """list_inbox returns structured message list."""
+        mock_message = _make_mock_message()
+        mock_client = _make_folder_mock([mock_message])
+
+        result = await list_inbox(mock_client, folder="inbox", count=25)
+        assert result["count"] == 1
+        assert result["messages"][0]["subject"] == "Test Subject"
+        assert result["messages"][0]["from_email"] == "sender@test.com"
+        assert result["messages"][0]["is_read"] is False
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_validates_count(self):
+        """Count is clamped to 1-100."""
+        mock_client = _make_folder_mock([])
+        result = await list_inbox(mock_client, count=200)
+        assert result["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_validates_dates(self):
+        """Date params are validated via validate_datetime."""
+        mock_client = MagicMock()
+        with pytest.raises(ValueError, match="Invalid datetime"):
+            await list_inbox(mock_client, after="not-a-date")
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_has_more(self):
+        """has_more is True when odata_next_link is present."""
+        mock_client = _make_folder_mock(
+            [_make_mock_message()],
+            next_link="https://graph.microsoft.com/v1.0/next",
+        )
+        result = await list_inbox(mock_client, count=1)
+        assert result["has_more"] is True
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_classification_filter_adds_odata(self):
+        """classification="focused" adds inferenceClassification filter to query."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, classification="focused")
+
+        call_kwargs = (
+            mock_client.me.mail_folders.by_mail_folder_id.return_value.messages.get.call_args
+        )
+        qp = call_kwargs.kwargs["request_configuration"].query_parameters
+        assert qp.filter is not None
+        assert "inferenceClassification eq 'focused'" in qp.filter
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_classification_other(self):
+        """classification="other" is allowed."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, classification="other")
+
+        call_kwargs = (
+            mock_client.me.mail_folders.by_mail_folder_id.return_value.messages.get.call_args
+        )
+        qp = call_kwargs.kwargs["request_configuration"].query_parameters
+        assert "inferenceClassification eq 'other'" in qp.filter
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_classification_invalid(self):
+        """Invalid classification raises ValueError."""
+        mock_client = _make_folder_mock([])
+        with pytest.raises(ValueError, match="classification"):
+            await list_inbox(mock_client, classification="bogus")
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_classification_combines_with_other_filters(self):
+        """classification filter combines with unread_only via 'and'."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, unread_only=True, classification="focused")
+
+        call_kwargs = (
+            mock_client.me.mail_folders.by_mail_folder_id.return_value.messages.get.call_args
+        )
+        qp = call_kwargs.kwargs["request_configuration"].query_parameters
+        assert "isRead eq false" in qp.filter
+        assert "inferenceClassification eq 'focused'" in qp.filter
+        assert " and " in qp.filter
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_uncategorized_only_adds_odata(self):
+        """uncategorized_only=True adds not categories/any() filter to query."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, uncategorized_only=True)
+
+        call_kwargs = (
+            mock_client.me.mail_folders.by_mail_folder_id.return_value.messages.get.call_args
+        )
+        qp = call_kwargs.kwargs["request_configuration"].query_parameters
+        assert qp.filter is not None
+        assert "not categories/any()" in qp.filter
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_uncategorized_only_absent_by_default(self):
+        """uncategorized_only=False (default) adds no $filter at all."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client)
+
+        call_kwargs = (
+            mock_client.me.mail_folders.by_mail_folder_id.return_value.messages.get.call_args
+        )
+        qp = call_kwargs.kwargs["request_configuration"].query_parameters
+        assert qp.filter is None
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_uncategorized_only_combines_with_other_filters(self):
+        """uncategorized_only joins with unread_only and classification via 'and'."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(
+            mock_client,
+            unread_only=True,
+            classification="focused",
+            uncategorized_only=True,
+        )
+
+        call_kwargs = (
+            mock_client.me.mail_folders.by_mail_folder_id.return_value.messages.get.call_args
+        )
+        qp = call_kwargs.kwargs["request_configuration"].query_parameters
+        assert "isRead eq false" in qp.filter
+        assert "inferenceClassification eq 'focused'" in qp.filter
+        assert "not categories/any()" in qp.filter
+
+
+class TestListInboxFilterOrdering:
+    """Graph 400s with InefficientFilter unless a receivedDateTime clause leads
+    the $filter, because $orderby is unconditionally receivedDateTime desc.
+    Clause ORDER is load-bearing, so these assert position, not just presence.
+    """
+
+    @staticmethod
+    def _filter_for(mock_client):
+        call_kwargs = (
+            mock_client.me.mail_folders.by_mail_folder_id.return_value.messages.get.call_args
+        )
+        return call_kwargs.kwargs["request_configuration"].query_parameters.filter
+
+    @pytest.mark.asyncio
+    async def test_no_filter_means_no_floor(self):
+        """An unfiltered call needs no floor — $orderby alone is fine."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client)
+        assert self._filter_for(mock_client) is None
+
+    @pytest.mark.asyncio
+    async def test_floor_prepended_for_non_date_filter(self):
+        """from_address alone returned 400 in 1.12.0 — it needs the floor."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, from_address="sarah@acme.com")
+        assert self._filter_for(mock_client) == (
+            f"receivedDateTime ge {RECEIVED_FLOOR} "
+            "and from/emailAddress/address eq 'sarah@acme.com'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_classification_leads_with_floor(self):
+        """classification alone also returned 400 in 1.12.0."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, classification="focused")
+        assert self._filter_for(mock_client).startswith(f"receivedDateTime ge {RECEIVED_FLOOR} and")
+
+    @pytest.mark.asyncio
+    async def test_caller_date_filter_is_not_double_floored(self):
+        """A caller-supplied `after` already satisfies the index — don't add."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, after="2026-01-01", from_address="s@acme.com")
+        filter_str = self._filter_for(mock_client)
+        assert RECEIVED_FLOOR not in filter_str
+        assert filter_str.startswith("receivedDateTime ge 2026-01-01")
+
+    @pytest.mark.asyncio
+    async def test_before_only_leads_and_is_not_floored(self):
+        """A `before`-only filter leads with `le` and is accepted by Graph."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(mock_client, before="2026-06-01", unread_only=True)
+        filter_str = self._filter_for(mock_client)
+        assert RECEIVED_FLOOR not in filter_str
+        assert filter_str.startswith("receivedDateTime le 2026-06-01")
+
+    @pytest.mark.asyncio
+    async def test_date_clauses_always_precede_other_clauses(self):
+        """The invariant: no non-date clause may appear before a date clause."""
+        mock_client = _make_folder_mock([])
+        await list_inbox(
+            mock_client,
+            unread_only=True,
+            from_address="s@acme.com",
+            classification="focused",
+            after="2026-01-01",
+            before="2026-06-01",
+        )
+        clauses = self._filter_for(mock_client).split(" and ")
+        is_date = [c.startswith("receivedDateTime") for c in clauses]
+        assert is_date == sorted(is_date, reverse=True), clauses
+
+    @pytest.mark.asyncio
+    async def test_validation_error_precedence_unchanged(self):
+        """Reordering emitted clauses must not reorder validation errors."""
+        mock_client = _make_folder_mock([])
+        with pytest.raises(ValueError, match="email"):
+            await list_inbox(mock_client, from_address="bogus", after="not-a-date")
+
+
+class TestReadMessage:
+    @pytest.mark.asyncio
+    async def test_read_message_text_format(self):
+        """read_message returns text body by default."""
+        mock_msg = _make_mock_message(body_content="<p>Hello World</p>")
+        mock_client = _make_message_mock(mock_msg)
+        result = await read_message(mock_client, "AAMkAG123=", format="text")
+        assert result["body"] != ""
+        assert result["body_html"] is None
+
+    @pytest.mark.asyncio
+    async def test_read_message_html_format(self):
+        """read_message with format=html returns body_html."""
+        mock_msg = _make_mock_message(body_content="<p>Hello</p>")
+        mock_client = _make_message_mock(mock_msg)
+        result = await read_message(mock_client, "AAMkAG123=", format="html")
+        assert result["body_html"] == "<p>Hello</p>"
+        assert result["body"] == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fmt", ["html", "full"])
+    async def test_control_characters_are_stripped_from_the_html_body(self, fmt):
+        """The text form has always been cleaned; the HTML form gets the same rule."""
+        raw = "<p>Hi\x1b[31mred\x1b[0m\x07 \x9b\x85there\x00</p>"
+        mock_client = _make_message_mock(_make_mock_message(body_content=raw))
+        result = await read_message(mock_client, "AAMkAG123=", format=fmt)
+        assert result["body_html"] == "<p>Hired there</p>"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fmt", ["html", "full"])
+    async def test_ordinary_html_is_returned_unchanged(self, fmt):
+        """Markup, entities, tabs, line breaks, non-ASCII, zero-width and bidi stay as sent."""
+        mock_client = _make_message_mock(_make_mock_message(body_content=ORDINARY_HTML))
+        result = await read_message(mock_client, "AAMkAG123=", format=fmt)
+        assert result["body_html"] == ORDINARY_HTML
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fmt", ["html", "full"])
+    async def test_a_form_feed_in_the_html_body_still_separates_what_it_stood_between(self, fmt):
+        """Form feed is whitespace in HTML: deleted, it would join a tag name to its
+        attribute, and `<a\\x0chref>` would no longer be a link. It becomes a space."""
+        raw = "<p><a\x0chref='https://example.com/'>link</a>\x0cnext</p>"
+        mock_client = _make_message_mock(_make_mock_message(body_content=raw))
+        result = await read_message(mock_client, "AAMkAG123=", format=fmt)
+        assert result["body_html"] == "<p><a href='https://example.com/'>link</a> next</p>"
+
+    @pytest.mark.asyncio
+    async def test_read_message_validates_id(self):
+        """read_message rejects invalid message IDs."""
+        mock_client = MagicMock()
+        with pytest.raises(ValueError, match="invalid characters"):
+            await read_message(mock_client, "bad id with spaces!")
+
+
+def _make_lookup_mock(found_ids, msg=None):
+    """A client whose ``me.messages.get`` answers a Message-ID lookup with ``found_ids``.
+
+    Chain: client.me.messages.get(...) for the lookup, then
+    client.me.messages.by_message_id(id).get() for the read.
+    """
+    client = _make_message_mock(msg or _make_mock_message())
+    lookup = MagicMock(value=[MagicMock(id=i) for i in found_ids], odata_next_link=None)
+    client.me.messages.get = AsyncMock(return_value=lookup)
+    return client
+
+
+def _lookup_params(client):
+    return client.me.messages.get.call_args.kwargs["request_configuration"].query_parameters
+
+
+class TestReadMessageByInternetMessageId:
+    @pytest.mark.asyncio
+    async def test_a_message_id_is_looked_up_then_read_by_its_graph_id(self):
+        client = _make_lookup_mock(["AAMkFound="])
+        result = await read_message(client, "<a+b/c=d@mail.example.com>")
+
+        qp = _lookup_params(client)
+        assert qp.filter == "internetMessageId eq '<a+b/c=d@mail.example.com>'"
+        assert qp.select == ["id"]
+        client.me.messages.by_message_id.assert_called_once_with("AAMkFound=")
+        assert result["id"] == "AAMkAG123="  # the id of the message the read returned
+
+    @pytest.mark.asyncio
+    async def test_an_apostrophe_is_doubled_inside_the_literal(self):
+        client = _make_lookup_mock(["AAMkFound="])
+        await read_message(client, "<o'brien.1@example.com>")
+        assert _lookup_params(client).filter == "internetMessageId eq '<o''brien.1@example.com>'"
+
+    @pytest.mark.asyncio
+    async def test_a_graph_id_is_read_without_a_lookup(self):
+        client = _make_lookup_mock([])
+        await read_message(client, "AAMkAG123=")
+        client.me.messages.get.assert_not_called()
+        client.me.messages.by_message_id.assert_called_once_with("AAMkAG123=")
+
+    @pytest.mark.asyncio
+    async def test_no_match_is_not_found_and_reads_nothing(self):
+        client = _make_lookup_mock([])
+        with pytest.raises(NotFoundError, match="<gone@example.com>"):
+            await read_message(client, "<gone@example.com>")
+        client.me.messages.by_message_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_copies_in_several_folders_are_named_not_guessed(self):
+        """A Message-ID is shared by every copy of a message; picking one would be a guess."""
+        client = _make_lookup_mock(["AAMkInbox=", "AAMkSent="])
+        with pytest.raises(ValueError, match="2 messages") as exc:
+            await read_message(client, "<copied@example.com>")
+        assert "AAMkInbox=" in str(exc.value) and "AAMkSent=" in str(exc.value)
+        client.me.messages.by_message_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_message_id_is_refused_before_any_request(self):
+        client = _make_lookup_mock(["AAMkFound="])
+        with pytest.raises(ValueError, match="Message-ID"):
+            await read_message(client, "<two words@example.com>")
+        client.me.messages.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_deferred_send_read_uses_the_resolved_id(self):
+        client = _make_lookup_mock(["AAMkFound="])
+        adapter = client.me.messages.by_message_id.return_value.request_adapter
+        adapter.base_url = "https://graph.microsoft.com/v1.0"
+        adapter.send_async = AsyncMock(return_value=_make_mock_message())
+
+        await read_message(client, "<a@example.com>", include_deferred_send=True)
+
+        info = adapter.send_async.call_args.args[0]
+        raw_url = info.path_parameters[info.RAW_URL_KEY]
+        assert raw_url.startswith("https://graph.microsoft.com/v1.0/me/messages/AAMkFound%3D?")
+
+
+class TestSearchMail:
+    @pytest.mark.asyncio
+    async def test_search_sanitizes_query(self):
+        """Search query is sanitized before sending to Graph."""
+        mock_client = _make_search_mock([])
+        result = await search_mail(mock_client, query='test" OR (hack)')
+        assert result["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_search_with_folder(self):
+        """Search within a specific folder uses folder endpoint."""
+        mock_client = _make_folder_mock([])
+        result = await search_mail(mock_client, query="test", folder="inbox")
+        assert result["count"] == 0
+        mock_client.me.mail_folders.by_mail_folder_id.assert_called_with("inbox")
+
+
+class TestConciseMode:
+    @pytest.mark.asyncio
+    async def test_list_inbox_concise_drops_body_and_recipients(self):
+        """concise=True drops preview and categories from each message summary."""
+        mock_message = _make_mock_message(
+            body_preview="Long preview text...",
+            categories=["Red", "Blue"],
+        )
+        mock_client = _make_folder_mock([mock_message])
+        result = await list_inbox(mock_client, folder="inbox", concise=True)
+        msg = result["messages"][0]
+        assert "preview" not in msg
+        assert "categories" not in msg
+        # Headers kept
+        assert msg["id"] == "AAMkAG123="
+        assert msg["from_email"] == "sender@test.com"
+        assert msg["subject"] == "Test Subject"
+        assert msg["is_read"] is False
+        assert msg["has_attachments"] is False
+        assert msg["conversation_id"] == "conv123"
+        assert msg["importance"] == "normal"
+
+    @pytest.mark.asyncio
+    async def test_list_inbox_default_keeps_full_shape(self):
+        """concise=False (default) preserves the existing message shape."""
+        mock_client = _make_folder_mock([_make_mock_message()])
+        result = await list_inbox(mock_client, folder="inbox")
+        msg = result["messages"][0]
+        assert "preview" in msg
+        assert "categories" in msg
+
+    @pytest.mark.asyncio
+    async def test_read_message_concise_drops_body_keeps_preview(self):
+        """concise=True replaces body/body_html with a single-line body_preview."""
+        mock_msg = _make_mock_message(
+            body_content="<p>Hello\n\nworld   with   spaces</p>" + ("x" * 500),
+        )
+        mock_client = _make_message_mock(mock_msg)
+        result = await read_message(mock_client, "AAMkAG123=", concise=True)
+        assert "body" not in result
+        assert "body_html" not in result
+        assert "body_preview" in result
+        # Preview is single-line and capped at 200 chars.
+        assert "\n" not in result["body_preview"]
+        assert len(result["body_preview"]) <= 200
+        # Headers preserved.
+        assert result["subject"] == "Test Subject"
+        assert result["from_email"] == "sender@test.com"
+        assert "to" in result
+        assert "cc" in result
+
+    @pytest.mark.asyncio
+    async def test_read_message_default_keeps_full_body(self):
+        """concise=False (default) keeps the existing body/body_html fields."""
+        mock_msg = _make_mock_message(body_content="<p>Hello</p>")
+        mock_client = _make_message_mock(mock_msg)
+        result = await read_message(mock_client, "AAMkAG123=")
+        assert "body" in result
+        assert "body_html" in result
+        assert "body_preview" not in result
+
+    @pytest.mark.asyncio
+    async def test_search_mail_concise_drops_body_and_recipients(self):
+        """concise=True drops preview and categories from search results."""
+        mock_message = _make_mock_message(
+            body_preview="Long preview...",
+            categories=["Important"],
+        )
+        mock_client = _make_search_mock([mock_message])
+        result = await search_mail(mock_client, query="test", concise=True)
+        msg = result["messages"][0]
+        assert "preview" not in msg
+        assert "categories" not in msg
+        assert msg["subject"] == "Test Subject"
+
+    @pytest.mark.asyncio
+    async def test_search_mail_default_keeps_full_shape(self):
+        """concise=False (default) preserves the existing search result shape."""
+        mock_client = _make_search_mock([_make_mock_message()])
+        result = await search_mail(mock_client, query="test")
+        msg = result["messages"][0]
+        assert "preview" in msg
+        assert "categories" in msg
+
+
+def _make_folder(folder_id: str, name: str, *, total=0, unread=0, parent_id=None, children=0):
+    """Build a MagicMock that stands in for a Graph MailFolder entity."""
+    f = MagicMock()
+    f.id = folder_id
+    f.display_name = name
+    f.total_item_count = total
+    f.unread_item_count = unread
+    f.parent_folder_id = parent_id
+    f.child_folder_count = children
+    return f
+
+
+class TestListFolders:
+    @pytest.mark.asyncio
+    async def test_list_folders_returns_folders(self):
+        """list_folders returns folder list with counts, parent_id, child_count."""
+        mock_folder = _make_folder(
+            "folder123", "Inbox", total=42, unread=5, parent_id="root", children=2
+        )
+
+        mock_client = MagicMock()
+        mock_client.me.mail_folders.get = AsyncMock(
+            return_value=MagicMock(value=[mock_folder], odata_next_link=None)
+        )
+
+        result = await list_folders(mock_client)
+        assert result["count"] == 1
+        assert result["folders"][0]["name"] == "Inbox"
+        assert result["folders"][0]["total"] == 42
+        assert result["folders"][0]["unread"] == 5
+        assert result["folders"][0]["parent_id"] == "root"
+        assert result["folders"][0]["child_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_list_folders_recursive_walks_subfolders(self):
+        """recursive=True returns the full folder tree via BFS walk."""
+        inbox = _make_folder("inbox_id", "Inbox", parent_id="root", children=0)
+        receipts = _make_folder("receipts_id", "Receipts", parent_id="root", children=1)
+        domains = _make_folder("domains_id", "Domains", parent_id="receipts_id", children=0)
+
+        mock_client = MagicMock()
+        mock_client.me.mail_folders.get = AsyncMock(
+            return_value=MagicMock(value=[inbox, receipts], odata_next_link=None)
+        )
+        child_builder = MagicMock()
+        child_builder.child_folders.get = AsyncMock(
+            return_value=MagicMock(value=[domains], odata_next_link=None)
+        )
+        mock_client.me.mail_folders.by_mail_folder_id = MagicMock(return_value=child_builder)
+
+        result = await list_folders(mock_client, recursive=True)
+        names = {f["name"] for f in result["folders"]}
+        assert names == {"Inbox", "Receipts", "Domains"}
+        assert result["count"] == 3
+        assert result["has_more"] is False
+        # Only the folder with children triggers a child_folders fetch.
+        mock_client.me.mail_folders.by_mail_folder_id.assert_called_once_with("receipts_id")
+
+    @pytest.mark.asyncio
+    async def test_list_folders_recursive_returns_each_folders_path(self):
+        """Each path is the one resolve_folder_id takes back, "/" in a name doubled."""
+        inbox = _make_folder("inbox_id", "Inbox", children=1)
+        travel = _make_folder("travel_id", "Travel", parent_id="inbox_id", children=1)
+        q = _make_folder("q_id", "Q1/Q2", parent_id="travel_id")
+        children = {"inbox_id": [travel], "travel_id": [q]}
+
+        def by_id(folder_id):
+            b = MagicMock()
+            b.child_folders.get = AsyncMock(
+                return_value=MagicMock(value=children[folder_id], odata_next_link=None)
+            )
+            return b
+
+        mock_client = MagicMock()
+        mock_client.me.mail_folders.get = AsyncMock(
+            return_value=MagicMock(value=[inbox], odata_next_link=None)
+        )
+        mock_client.me.mail_folders.by_mail_folder_id = MagicMock(side_effect=by_id)
+
+        result = await list_folders(mock_client, recursive=True)
+
+        assert {f["id"]: f["path"] for f in result["folders"]} == {
+            "inbox_id": "Inbox",
+            "travel_id": "Inbox/Travel",
+            "q_id": "Inbox/Travel/Q1//Q2",
+        }
+        assert {f["name"] for f in result["folders"]} == {"Inbox", "Travel", "Q1/Q2"}
+
+    @pytest.mark.asyncio
+    async def test_list_folders_top_level_is_unchanged(self):
+        """The paginated top-level listing has no `path`: the name is the path there."""
+        mock_client = MagicMock()
+        mock_client.me.mail_folders.get = AsyncMock(
+            return_value=MagicMock(value=[_make_folder("i", "Inbox")], odata_next_link=None)
+        )
+
+        result = await list_folders(mock_client)
+
+        assert "path" not in result["folders"][0]
+
+    @pytest.mark.asyncio
+    async def test_list_folders_recursive_paginates_child_folders(self):
+        """Child-folder listings follow odata_next_link so >10 subfolders are returned."""
+        inbox = _make_folder("inbox_id", "Inbox", parent_id="root", children=15)
+
+        page1 = [_make_folder(f"c{i}", f"Child{i}", parent_id="inbox_id") for i in range(10)]
+        page2 = [_make_folder(f"c{i}", f"Child{i}", parent_id="inbox_id") for i in range(10, 15)]
+
+        mock_client = MagicMock()
+        mock_client.me.mail_folders.get = AsyncMock(
+            return_value=MagicMock(value=[inbox], odata_next_link=None)
+        )
+        child_builder = MagicMock()
+        # First page has nextLink; with_url(...)  returns a builder whose get() returns page2.
+        page1_response = MagicMock(value=page1, odata_next_link="https://next-page")
+        page2_response = MagicMock(value=page2, odata_next_link=None)
+        next_page_builder = MagicMock()
+        next_page_builder.get = AsyncMock(return_value=page2_response)
+        child_builder.child_folders.get = AsyncMock(return_value=page1_response)
+        child_builder.child_folders.with_url = MagicMock(return_value=next_page_builder)
+        mock_client.me.mail_folders.by_mail_folder_id = MagicMock(return_value=child_builder)
+
+        result = await list_folders(mock_client, recursive=True)
+        names = {f["name"] for f in result["folders"]}
+        # Inbox + 15 children
+        assert len(result["folders"]) == 16
+        assert "Inbox" in names
+        assert {f"Child{i}" for i in range(15)}.issubset(names)
+        child_builder.child_folders.with_url.assert_called_once_with("https://next-page")
