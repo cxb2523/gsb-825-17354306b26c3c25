@@ -31,7 +31,15 @@ ROOTS = {f"{PACKAGE}.cli"}
 
 # Modules that exist for reasons other than being imported. Keep short, with
 # a reason. There are none today; the set is here so the next one has a home.
-ALLOWED: dict[str, str] = {}
+ALLOWED: dict[str, str] = {
+    # An offline diagnostic surface for operators and tooling: it mirrors the
+    # startup path's decisions without building a credential, so the server
+    # entry point has nothing to gain from importing it — its callers drive
+    # it directly with a record and a refresh outcome they already hold.
+    f"{PACKAGE}.auth_diagnostics": (
+        "pure offline diagnostic; driven directly by tooling/tests, not by the server"
+    ),
+}
 
 
 def _module_name(path: pathlib.Path) -> str:
